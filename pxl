@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="1.0.0"
+PROG="${0##*/}"
+
+# Defaults
+CRF=32
+MAX_W=1200
+OUTPUT=""
+FORMAT="avif"
+MODE="region"    # region | window
+NO_RESIZE=false
+OPEN_AFTER=false
+
+# Colors
+R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m'
+B='\033[0;34m' D='\033[2m' N='\033[0m'
+
+usage() {
+  cat <<EOF
+${PROG} — tiny screenshots for GitHub
+
+Usage:
+  ${PROG}                     Screenshot region → AVIF
+  ${PROG} <file> [file...]    Crush existing image(s) → AVIF
+  ${PROG} -w                  Screenshot window → AVIF
+
+Flags:
+  -q <1-63>     Quality/CRF (default: 32, higher = smaller)
+  -m <px>       Max width (default: 1200)
+  -o <path>     Output path (default: auto-named in cwd)
+  -s            SVG output (requires: brew install potrace)
+  -w            Window capture mode
+  --webp        WebP fallback format
+  --no-resize   Keep original dimensions
+  --open        Open result in Preview
+  -h, --help    Show this help
+  -v, --version Show version
+
+Examples:
+  ${PROG}                        # capture region, encode AVIF
+  ${PROG} screenshot.png         # crush PNG → AVIF
+  ${PROG} -q 40 *.png            # batch crush, aggressive quality
+  ${PROG} --webp shot.png        # WebP output
+  ${PROG} -w -o hero.avif        # capture window, custom output name
+EOF
+  exit 0
+}
+
+die() { printf "${R}error:${N} %s\n" "$1" >&2; exit 1; }
+
+check_deps() {
+  command -v ffmpeg >/dev/null || die "ffmpeg not found (brew install ffmpeg)"
+  command -v sips >/dev/null || die "sips not found (requires macOS)"
+  command -v screencapture >/dev/null || die "screencapture not found (requires macOS)"
+
+  # Verify SVT-AV1 encoder if we need AVIF
+  if [[ "$FORMAT" == "avif" ]]; then
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libsvtav1 \
+      || die "ffmpeg missing libsvtav1 encoder (brew install ffmpeg — ensure svt-av1 linked)"
+  fi
+
+  # WebP mode needs cwebp
+  if [[ "$FORMAT" == "webp" ]]; then
+    command -v cwebp >/dev/null || die "cwebp not found (brew install webp)"
+  fi
+
+  # SVG mode needs potrace
+  if [[ "$FORMAT" == "svg" ]]; then
+    command -v potrace >/dev/null || die "potrace not found (brew install potrace)"
+  fi
+}
+
+generate_name() {
+  local ext="$1"
+  printf "pxl-%s.%s" "$(date +%Y%m%d-%H%M%S)" "$ext"
+}
+
+capture() {
+  local tmp
+  tmp=$(mktemp /tmp/pxl-cap-XXXXXX)
+  mv "$tmp" "${tmp}.png"
+  tmp="${tmp}.png"
+  CLEANUP_FILES+=("$tmp")
+
+  case "$MODE" in
+    region) screencapture -i -s "$tmp" ;;
+    window) screencapture -i -w "$tmp" ;;
+  esac
+
+  # screencapture exits 0 even if user cancels — check file
+  [[ -s "$tmp" ]] || die "capture cancelled"
+  printf "$tmp"
+}
+
+encode_avif() {
+  local input="$1" output="$2"
+  local scale_filter
+
+  if [[ "$NO_RESIZE" == true ]]; then
+    scale_filter="scale=iw:-2:flags=lanczos"
+  else
+    scale_filter="scale='min(${MAX_W},iw)':-2:flags=lanczos"
+  fi
+
+  local err_log
+  err_log=$(mktemp /tmp/pxl-err-XXXXXX)
+  CLEANUP_FILES+=("$err_log")
+
+  if ! ffmpeg -loglevel error -nostdin -i "$input" \
+    -vf "$scale_filter" \
+    -c:v libsvtav1 \
+    -crf "$CRF" \
+    -preset 4 \
+    -svtav1-params "tune=0:still-picture=1:enable-qm=1:qm-min=0:qm-max=15:film-grain=0:film-grain-denoise=0" \
+    -pix_fmt yuv420p \
+    -frames:v 1 -an -y "$output" 2>"$err_log"; then
+    cat "$err_log" >&2
+    die "ffmpeg encoding failed"
+  fi
+}
+
+encode_webp() {
+  local input="$1" output="$2"
+
+  # Resize first if needed
+  local src="$input"
+  if [[ "$NO_RESIZE" != true ]]; then
+    local cur_w
+    cur_w=$(sips -g pixelWidth "$input" 2>/dev/null | awk '/pixelWidth/{print $2}')
+    if (( cur_w > MAX_W )); then
+      local tmp_resized
+      tmp_resized=$(mktemp /tmp/pxl-rsz-XXXXXX)
+      mv "$tmp_resized" "${tmp_resized}.png"
+      tmp_resized="${tmp_resized}.png"
+      CLEANUP_FILES+=("$tmp_resized")
+      cp "$input" "$tmp_resized"
+      sips --resampleWidth "$MAX_W" "$tmp_resized" >/dev/null 2>&1
+      src="$tmp_resized"
+    fi
+  fi
+
+  cwebp -q 80 -m 6 -quiet "$src" -o "$output"
+}
+
+encode_svg() {
+  local input="$1" output="$2"
+  local tmp_bmp
+  tmp_bmp=$(mktemp /tmp/pxl-bmp-XXXXXX)
+  mv "$tmp_bmp" "${tmp_bmp}.bmp"
+  tmp_bmp="${tmp_bmp}.bmp"
+  CLEANUP_FILES+=("$tmp_bmp")
+
+  # Convert to BMP for potrace
+  sips -s format bmp "$input" --out "$tmp_bmp" >/dev/null 2>&1
+
+  potrace -s -o "$output" "$tmp_bmp"
+
+  # Warn if SVG is larger than a hypothetical AVIF would be
+  local svg_size avif_tmp
+  svg_size=$(stat -f%z "$output")
+  if (( svg_size > 50000 )); then
+    printf "${Y}note:${N} SVG is %s — AVIF might be smaller for this image\n" "$(format_size "$svg_size")"
+  fi
+}
+
+encode_file() {
+  local input="$1"
+  local output="$2"
+
+  case "$FORMAT" in
+    avif) encode_avif "$input" "$output" ;;
+    webp) encode_webp "$input" "$output" ;;
+    svg)  encode_svg "$input" "$output" ;;
+  esac
+}
+
+format_size() {
+  local bytes="$1"
+  if (( bytes >= 1048576 )); then
+    printf "%.1f MB" "$(echo "scale=1; $bytes / 1048576" | bc)"
+  elif (( bytes >= 1024 )); then
+    printf "%d KB" "$(( bytes / 1024 ))"
+  else
+    printf "%d B" "$bytes"
+  fi
+}
+
+print_result() {
+  local file="$1"
+  local size
+  size=$(stat -f%z "$file")
+  local pretty
+  pretty=$(format_size "$size")
+  local color
+
+  if (( size < 20480 )); then
+    color="$G"
+  elif (( size < 51200 )); then
+    color="$Y"
+  else
+    color="$R"
+  fi
+
+  printf "${color}%s${N}  %s\n" "$pretty" "$file"
+}
+
+to_clipboard() {
+  local file="$1"
+  printf "%s" "$(cd "$(dirname "$file")" && pwd)/$(basename "$file")" | pbcopy
+}
+
+cleanup() {
+  local ec=$?
+  for f in "${CLEANUP_FILES[@]+"${CLEANUP_FILES[@]}"}"; do
+    [[ -f "$f" ]] && rm -f "$f"
+  done
+  exit $ec
+}
+
+CLEANUP_FILES=()
+trap cleanup EXIT
+
+# --- Arg parsing ---
+FILES=()
+
+while (( $# )); do
+  case "$1" in
+    -q)
+      shift; [[ $# -gt 0 ]] || die "-q requires a value (1-63)"
+      CRF="$1"
+      (( CRF >= 1 && CRF <= 63 )) || die "CRF must be 1-63"
+      ;;
+    -m)
+      shift; [[ $# -gt 0 ]] || die "-m requires a value"
+      MAX_W="$1"
+      ;;
+    -o)
+      shift; [[ $# -gt 0 ]] || die "-o requires a path"
+      OUTPUT="$1"
+      ;;
+    -s)       FORMAT="svg" ;;
+    -w)       MODE="window" ;;
+    --webp)   FORMAT="webp" ;;
+    --no-resize) NO_RESIZE=true ;;
+    --open)   OPEN_AFTER=true ;;
+    -h|--help) usage ;;
+    -v|--version) echo "$PROG $VERSION"; exit 0 ;;
+    -*)       die "unknown flag: $1" ;;
+    *)        FILES+=("$1") ;;
+  esac
+  shift
+done
+
+check_deps
+
+# --- Main ---
+
+process_one() {
+  local input="$1"
+  local output
+
+  [[ -f "$input" ]] || die "file not found: $input"
+
+  if [[ -n "$OUTPUT" ]]; then
+    output="$OUTPUT"
+  else
+    output="$(generate_name "$FORMAT")"
+  fi
+
+  encode_file "$input" "$output"
+  print_result "$output"
+  to_clipboard "$output"
+
+  [[ "$OPEN_AFTER" == true ]] && open "$output" || true
+}
+
+if (( ${#FILES[@]} == 0 )); then
+  # Screenshot mode
+  printf "${D}capturing...${N}\n"
+  captured=$(capture)
+
+  if [[ -n "$OUTPUT" ]]; then
+    out="$OUTPUT"
+  else
+    out="$(generate_name "$FORMAT")"
+  fi
+
+  printf "${D}encoding %s...${N}\n" "$FORMAT"
+  encode_file "$captured" "$out"
+  print_result "$out"
+  to_clipboard "$out"
+
+  [[ "$OPEN_AFTER" == true ]] && open "$out" || true
+elif (( ${#FILES[@]} == 1 )); then
+  process_one "${FILES[0]}"
+else
+  # Batch mode — ignore -o flag, auto-name each
+  if [[ -n "$OUTPUT" ]]; then
+    printf "${Y}note:${N} -o ignored in batch mode (auto-naming each file)\n"
+    OUTPUT=""
+  fi
+  for f in "${FILES[@]}"; do
+    process_one "$f"
+  done
+fi
